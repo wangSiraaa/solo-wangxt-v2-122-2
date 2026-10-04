@@ -1,0 +1,18 @@
+{
+  "zone": "lab.test.",
+  "listen_udp": "127.0.0.1:5354",
+  "listen_tcp": "127.0.0.1:5354",
+  "database_url": "postgres://dnsadmin@127.0.0.1:55432/dnszone?sslmode=disable",
+  "ttl_min": 30,
+  "ttl_max": 86400,
+  "transfer_allow_cidrs": [
+    "127.0.0.0/8",
+    "::1/128"
+  ],
+  "tsig_keys": {
+    "transfer-key.lab.test.": {
+      "algorithm": "hmac-sha256",
+      "secret_b64": "dGVzdC1rZXktc2VjcmV0LWZvci1sYWItdGVzdC16b25lLTAtMDAx"
+    }
+  }
+}
