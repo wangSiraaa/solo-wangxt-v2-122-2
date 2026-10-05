@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -232,6 +233,144 @@ func TestChangelogDrivesIXFRDelta(t *testing.T) {
 	if sawSOA {
 		t.Fatal("SOA must not appear in record deltas")
 	}
+}
+
+func TestRepublishHistoricalVersionCreatesForwardDelta(t *testing.T) {
+	s := freshStore(t)
+	ctx := context.Background()
+	lim := zone.Limits{MinTTL: 30, MaxTTL: 86400}
+
+	v1 := parse(t, content(0))
+	if _, err := s.Publish(ctx, v1, "v1", lim); err != nil {
+		t.Fatal(err)
+	}
+	v2 := parse(t, content(2))
+	if _, err := s.Publish(ctx, v2, "v2", lim); err != nil {
+		t.Fatal(err)
+	}
+
+	res, err := s.Republish(ctx, 1, "restore v1 content", lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Serial != 3 {
+		t.Fatalf("republished serial = %d, want new serial 3", res.Serial)
+	}
+
+	current, err := s.LoadCurrent(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current.Serial != 3 || current.SOA().Serial != 3 {
+		t.Fatalf("current serial = %d (SOA %d), want 3", current.Serial, current.SOA().Serial)
+	}
+	source, err := s.LoadSnapshot(ctx, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, want := nonSOA(current), nonSOA(source); got != want {
+		t.Fatalf("current content does not match serial 1:\ngot:  %s\nwant: %s", got, want)
+	}
+	if _, found := current.Lookup("host2.lab.test.", dns.TypeA); found {
+		t.Fatal("restored current snapshot still contains v2-only host2")
+	}
+
+	// The delta is from the *currently served* v2 to the new forward
+	// serial, not a serial rollback: v2's added record must be deleted.
+	changes, err := s.LoadChanges(ctx, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(changes) != 1 || changes[0].Action != "DEL" ||
+		changes[0].RR.Header().Name != "host2.lab.test." {
+		t.Fatalf("serial 3 changelog = %#v, want one DEL for host2", changes)
+	}
+
+	vs, err := s.ListVersions(ctx, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(vs) != 3 || vs[0].Serial != 3 || vs[0].Kind != "republish" ||
+		vs[0].SourceSerial == nil || *vs[0].SourceSerial != 1 {
+		t.Fatalf("version audit metadata wrong: %#v", vs)
+	}
+	// The mistaken v2 and source v1 records must both remain available.
+	if _, err := s.LoadSnapshot(ctx, 1); err != nil {
+		t.Fatalf("source v1 history removed: %v", err)
+	}
+	if _, err := s.LoadSnapshot(ctx, 2); err != nil {
+		t.Fatalf("mistaken v2 history removed: %v", err)
+	}
+}
+
+func TestRepublishMissingVersionIsNoOp(t *testing.T) {
+	s := freshStore(t)
+	ctx := context.Background()
+	lim := zone.Limits{MinTTL: 30, MaxTTL: 86400}
+	if _, err := s.Publish(ctx, parse(t, content(0)), "v1", lim); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := s.Republish(ctx, 999, "missing", lim)
+	if !errors.Is(err, ErrNoVersion) {
+		t.Fatalf("Republish missing version error = %v, want ErrNoVersion", err)
+	}
+	serial, err := s.CurrentSerial(ctx)
+	if err != nil || serial != 1 {
+		t.Fatalf("after missing republish serial=%d err=%v, want 1", serial, err)
+	}
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM zone_versions`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("versions rows=%d err=%v, want 1", n, err)
+	}
+	current, err := s.LoadCurrent(ctx)
+	if err != nil || current.Serial != 1 {
+		t.Fatalf("current snapshot changed after no-op: serial=%d err=%v", serial, err)
+	}
+}
+
+func TestRepublishRejectsHistoricalDataFailingCurrentRules(t *testing.T) {
+	s := freshStore(t)
+	ctx := context.Background()
+	oldLimits := zone.Limits{MinTTL: 30, MaxTTL: 86400}
+	ttl30, err := zone.Parse(strings.NewReader(`$ORIGIN lab.test.
+$TTL 30
+@ IN SOA ns1.lab.test. admin.lab.test. (1 7200 3600 1209600 300)
+@ IN NS ns1.lab.test.
+ns1 IN A 127.0.0.10
+`), origin, oldLimits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Publish(ctx, ttl30, "short-ttl", oldLimits); err != nil {
+		t.Fatal(err)
+	}
+
+	newLimits := zone.Limits{MinTTL: 60, MaxTTL: 86400}
+	if _, err := s.Republish(ctx, 1, "retry with new rules", newLimits); err == nil {
+		t.Fatal("historical TTL that violates current minimum must be rejected")
+	}
+	serial, err := s.CurrentSerial(ctx)
+	if err != nil || serial != 1 {
+		t.Fatalf("after invalid republish serial=%d err=%v, want 1", serial, err)
+	}
+	var n int
+	if err := s.pool.QueryRow(ctx,
+		`SELECT count(*) FROM zone_versions`).Scan(&n); err != nil || n != 1 {
+		t.Fatalf("versions rows=%d err=%v, want 1", n, err)
+	}
+}
+
+func nonSOA(snap *zone.Snapshot) string {
+	var lines []string
+	for _, rr := range snap.RRs {
+		if rr.Header().Rrtype == dns.TypeSOA {
+			continue
+		}
+		lines = append(lines, zone.CanonicalText(rr))
+	}
+	return strings.Join(lines, "\n")
 }
 
 // content returns a zone text where variant adds `variant` extra host

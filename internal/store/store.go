@@ -55,10 +55,13 @@ func (s *Store) migrate(ctx context.Context) error {
     CONSTRAINT singleton CHECK (id = 1)
 )`,
 		`CREATE TABLE IF NOT EXISTS zone_versions (
-    serial       bigint PRIMARY KEY,
-    origin       text NOT NULL,
-    published_at timestamptz NOT NULL DEFAULT now(),
-    note         text NOT NULL DEFAULT ''
+    serial        bigint PRIMARY KEY,
+    origin        text NOT NULL,
+    published_at  timestamptz NOT NULL DEFAULT now(),
+    note          text NOT NULL DEFAULT '',
+    kind          text NOT NULL DEFAULT 'publish',
+    source_serial bigint REFERENCES zone_versions(serial),
+    CONSTRAINT zone_versions_kind_check CHECK (kind IN ('publish','republish'))
 )`,
 		`CREATE TABLE IF NOT EXISTS zone_records (
     serial    bigint NOT NULL REFERENCES zone_versions(serial) ON DELETE CASCADE,
@@ -74,6 +77,30 @@ func (s *Store) migrate(ctx context.Context) error {
     rr_text     text NOT NULL
 )`,
 		`CREATE INDEX IF NOT EXISTS zone_changes_serial_idx ON zone_changes(serial, position)`,
+		`ALTER TABLE zone_versions ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'publish'`,
+		`ALTER TABLE zone_versions ADD COLUMN IF NOT EXISTS source_serial bigint`,
+		`DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'zone_versions_kind_check'
+    ) THEN
+        ALTER TABLE zone_versions
+            ADD CONSTRAINT zone_versions_kind_check
+            CHECK (kind IN ('publish','republish'));
+    END IF;
+END;
+$$`,
+		`DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM pg_constraint WHERE conname = 'zone_versions_source_serial_fkey'
+    ) THEN
+        ALTER TABLE zone_versions
+            ADD CONSTRAINT zone_versions_source_serial_fkey
+            FOREIGN KEY (source_serial) REFERENCES zone_versions(serial);
+    END IF;
+END;
+$$`,
 		`INSERT INTO zone_meta (id, origin, current_serial)
 VALUES (1, $1, 0)
 ON CONFLICT (id) DO NOTHING`,
@@ -105,9 +132,11 @@ func (s *Store) CurrentSerial(ctx context.Context) (uint32, error) {
 
 // PublishedVersion is one row of the version history.
 type PublishedVersion struct {
-	Serial      uint32
-	PublishedAt time.Time
-	Note        string
+	Serial       uint32
+	PublishedAt  time.Time
+	Note         string
+	Kind         string
+	SourceSerial *uint32
 }
 
 // ListVersions returns version metadata, newest first.
@@ -116,7 +145,8 @@ func (s *Store) ListVersions(ctx context.Context, limit int) ([]PublishedVersion
 		limit = 50
 	}
 	rows, err := s.pool.Query(ctx,
-		`SELECT serial, published_at, note FROM zone_versions ORDER BY serial DESC LIMIT $1`, limit)
+		`SELECT serial, published_at, note, kind, source_serial
+		   FROM zone_versions ORDER BY serial DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -124,11 +154,18 @@ func (s *Store) ListVersions(ctx context.Context, limit int) ([]PublishedVersion
 	var out []PublishedVersion
 	for rows.Next() {
 		var v PublishedVersion
-		var serial int64
-		if err := rows.Scan(&serial, &v.PublishedAt, &v.Note); err != nil {
+		var serial, sourceSerial *int64
+		if err := rows.Scan(&serial, &v.PublishedAt, &v.Note, &v.Kind, &sourceSerial); err != nil {
 			return nil, err
 		}
-		v.Serial = uint32(serial)
+		if serial == nil {
+			return nil, errors.New("database returned a null zone version serial")
+		}
+		v.Serial = uint32(*serial)
+		if sourceSerial != nil {
+			source := uint32(*sourceSerial)
+			v.SourceSerial = &source
+		}
 		out = append(out, v)
 	}
 	return out, rows.Err()
@@ -179,6 +216,39 @@ type PublishResult struct {
 // current pointer is moved, all before commit. Concurrent readers can
 // only observe the state before or after, never a mix.
 func (s *Store) Publish(ctx context.Context, rrs []dns.RR, note string, lim zone.Limits) (*PublishResult, error) {
+	return s.publishWithRetry(ctx, publishInput{
+		rrs:  rrs,
+		note: note,
+		kind: "publish",
+		lim:  lim,
+	})
+}
+
+// Republish loads the complete RR set for sourceSerial, revalidates it
+// against lim and the current zone rules, and publishes that content as
+// the next serial. The source version and the currently served version
+// both remain in history; only the current pointer advances. A missing
+// source or validation failure returns before the service pointer can
+// change.
+func (s *Store) Republish(ctx context.Context, sourceSerial uint32, note string, lim zone.Limits) (*PublishResult, error) {
+	source := int64(sourceSerial)
+	return s.publishWithRetry(ctx, publishInput{
+		note:         note,
+		kind:         "republish",
+		sourceSerial: &source,
+		lim:          lim,
+	})
+}
+
+type publishInput struct {
+	rrs          []dns.RR
+	note         string
+	kind         string
+	sourceSerial *int64
+	lim          zone.Limits
+}
+
+func (s *Store) publishWithRetry(ctx context.Context, in publishInput) (*PublishResult, error) {
 	var lastErr error
 	for attempt := 0; attempt < 10; attempt++ {
 		if attempt > 0 {
@@ -188,7 +258,7 @@ func (s *Store) Publish(ctx context.Context, rrs []dns.RR, note string, lim zone
 			case <-time.After(time.Duration(attempt*5) * time.Millisecond):
 			}
 		}
-		res, err := s.publishOnce(ctx, rrs, note, lim)
+		res, err := s.publishOnce(ctx, in)
 		if err == nil {
 			return res, nil
 		}
@@ -203,7 +273,7 @@ func (s *Store) Publish(ctx context.Context, rrs []dns.RR, note string, lim zone
 	return nil, fmt.Errorf("publish gave up after serialization retries: %w", lastErr)
 }
 
-func (s *Store) publishOnce(ctx context.Context, rrs []dns.RR, note string, lim zone.Limits) (*PublishResult, error) {
+func (s *Store) publishOnce(ctx context.Context, in publishInput) (*PublishResult, error) {
 	// Read Committed + SELECT ... FOR UPDATE on the singleton meta row:
 	// publishers queue on the row lock, and each one re-reads the current
 	// serial once it acquires the lock. The full RR set, changelog and
@@ -239,22 +309,46 @@ func (s *Store) publishOnce(ctx context.Context, rrs []dns.RR, note string, lim 
 		}
 	}
 
-	// Re-validate against configured TTL bounds and zone semantics.
-	checked := make([]dns.RR, 0, len(rrs))
-	for _, rr := range rrs {
-		if err := validateOne(rr, s.origin, lim); err != nil {
+	checked := in.rrs
+	if in.sourceSerial != nil {
+		var sourceExists bool
+		if err := tx.QueryRow(ctx,
+			`SELECT true FROM zone_versions WHERE serial = $1 FOR SHARE`,
+			*in.sourceSerial).Scan(&sourceExists); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return nil, fmt.Errorf("%w: %d", ErrNoVersion, *in.sourceSerial)
+			}
 			return nil, err
 		}
-		checked = append(checked, rr)
+		rows, err := tx.Query(ctx,
+			`SELECT rr_text FROM zone_records WHERE serial = $1 ORDER BY position FOR SHARE`,
+			*in.sourceSerial)
+		if err != nil {
+			return nil, err
+		}
+		checked, err = scanRRs(rows)
+		rows.Close()
+		if err != nil {
+			return nil, err
+		}
+		if len(checked) == 0 {
+			return nil, fmt.Errorf("%w: %d", ErrNoVersion, *in.sourceSerial)
+		}
 	}
-	if err := validateAgainst(checked, s.origin, lim); err != nil {
+
+	// Re-validate against the configured TTL bounds and current zone
+	// semantics before allocating/inserting a version. Historical data is
+	// therefore never allowed to bypass rules that have changed since it
+	// was published.
+	if err := zone.Validate(checked, s.origin, in.lim); err != nil {
 		return nil, err
 	}
 
 	nextSerial := prevSerial + 1
 	if _, err := tx.Exec(ctx,
-		`INSERT INTO zone_versions (serial, origin, note) VALUES ($1, $2, $3)`,
-		nextSerial, s.origin, note); err != nil {
+		`INSERT INTO zone_versions (serial, origin, note, kind, source_serial)
+		 VALUES ($1, $2, $3, $4, $5)`,
+		nextSerial, s.origin, in.note, in.kind, in.sourceSerial); err != nil {
 		return nil, err
 	}
 
@@ -352,68 +446,4 @@ func scanRRs(rows rowScanner) ([]dns.RR, error) {
 		rrs = append(rrs, rr)
 	}
 	return rrs, rows.Err()
-}
-
-func validateOne(rr dns.RR, origin string, lim zone.Limits) error {
-	h := rr.Header()
-	if h.Class != dns.ClassINET {
-		return fmt.Errorf("record %s %s: only class IN supported", h.Name, dns.TypeToString[h.Rrtype])
-	}
-	if !zone.IsAllowedType(h.Rrtype) {
-		return fmt.Errorf("record %s %s: type not supported by this server", h.Name, dns.TypeToString[h.Rrtype])
-	}
-	if h.Ttl < lim.MinTTL {
-		return fmt.Errorf("record %s %s: TTL %d below minimum %d", h.Name, dns.TypeToString[h.Rrtype], h.Ttl, lim.MinTTL)
-	}
-	if h.Ttl > lim.MaxTTL {
-		return fmt.Errorf("record %s %s: TTL %d above maximum %d", h.Name, dns.TypeToString[h.Rrtype], h.Ttl, lim.MaxTTL)
-	}
-	if !dns.IsSubDomain(origin, strings.ToLower(h.Name)) {
-		return fmt.Errorf("record %s %s: owner outside zone %s", h.Name, dns.TypeToString[h.Rrtype], origin)
-	}
-	return nil
-}
-
-// validateAgainst mirrors zone.ValidateSet without requiring a re-parse;
-// the zone package enforces it too, this gives the store a defense at
-// commit time.
-func validateAgainst(rrs []dns.RR, origin string, _ zone.Limits) error {
-	soa, ns := 0, 0
-	byName := map[string]map[uint16]int{}
-	for _, rr := range rrs {
-		h := rr.Header()
-		name := strings.ToLower(h.Name)
-		if name == origin {
-			switch h.Rrtype {
-			case dns.TypeSOA:
-				soa++
-			case dns.TypeNS:
-				ns++
-			}
-		}
-		if byName[name] == nil {
-			byName[name] = map[uint16]int{}
-		}
-		byName[name][h.Rrtype]++
-	}
-	if soa != 1 {
-		return fmt.Errorf("zone must contain exactly one SOA at apex, found %d", soa)
-	}
-	if ns == 0 {
-		return errors.New("zone must contain at least one NS at apex")
-	}
-	for name, types := range byName {
-		if c := types[dns.TypeCNAME]; c > 0 {
-			if name == origin {
-				return errors.New("CNAME at zone apex is forbidden")
-			}
-			if c > 1 {
-				return fmt.Errorf("multiple CNAME at %s", name)
-			}
-			if len(types) > 1 {
-				return fmt.Errorf("CNAME at %s conflicts with coexisting record type(s)", name)
-			}
-		}
-	}
-	return nil
 }

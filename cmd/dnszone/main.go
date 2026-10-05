@@ -3,9 +3,10 @@
 //
 // Usage:
 //
-//	dnszone serve   --config config.json
-//	dnszone publish --config config.json --file zone.db [--note "..."]
-//	dnszone versions --config config.json
+//	dnszone serve     --config config.json
+//	dnszone publish   --config config.json --file zone.db [--note "..."]
+//	dnszone republish --config config.json --serial N [--note "..."]
+//	dnszone versions  --config config.json
 package main
 
 import (
@@ -35,6 +36,8 @@ func main() {
 		err = runServe(args)
 	case "publish":
 		err = runPublish(args)
+	case "republish", "restore":
+		err = runRepublish(args)
 	case "versions":
 		err = runVersions(args)
 	case "-h", "--help", "help":
@@ -53,9 +56,10 @@ func usage() {
 	fmt.Fprint(os.Stderr, `dnszone - local test-domain authoritative DNS service
 
 Commands:
-  serve     run the authoritative UDP/TCP server
-  publish   atomically publish a zone file as a new version
-  versions  list published zone versions
+  serve      run the authoritative UDP/TCP server
+  publish    atomically publish a zone file as a new version
+  republish  revalidate and republish a saved historical version as a new serial
+  versions   list published zone versions
 
 Run "<command> -h" for command flags.
 `)
@@ -141,6 +145,47 @@ func runPublish(args []string) error {
 	return nil
 }
 
+func runRepublish(args []string) error {
+	fs := flag.NewFlagSet("republish", flag.ContinueOnError)
+	cfgPath := fs.String("config", "config.json", "path to config JSON")
+	serial := fs.Uint64("serial", 0, "historical zone serial to republish")
+	note := fs.String("note", "", "change note stored with the new version")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *serial == 0 || *serial > uint64(^uint32(0)) {
+		return fmt.Errorf("serial must be a positive 32-bit DNS serial")
+	}
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st, err := store.New(ctx, cfg.DatabaseURL, cfg.ZoneOrigin())
+	if err != nil {
+		return fmt.Errorf("postgres: %w", err)
+	}
+	defer st.Close()
+
+	lim := zone.Limits{MinTTL: cfg.TTLMin, MaxTTL: cfg.TTLMax}
+	changeNote := *note
+	if changeNote == "" {
+		changeNote = fmt.Sprintf("republish historical version %d", *serial)
+	}
+	res, err := st.Republish(ctx, uint32(*serial), changeNote, lim)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("republished historical serial %d as serial %d (%d record changes)\n",
+		*serial, res.Serial, len(res.Changes))
+	for _, c := range res.Changes {
+		fmt.Printf("  %s %s\n", c.Action, zone.CanonicalText(c.RR))
+	}
+	return nil
+}
+
 func runVersions(args []string) error {
 	fs := flag.NewFlagSet("versions", flag.ContinueOnError)
 	cfgPath := fs.String("config", "config.json", "path to config JSON")
@@ -164,8 +209,12 @@ func runVersions(args []string) error {
 	}
 	fmt.Printf("current zone: %s\n", cfg.ZoneOrigin())
 	for _, v := range vs {
-		fmt.Printf("  serial %d  %s  %q\n", v.Serial,
+		line := fmt.Sprintf("  serial %d  %s  %q", v.Serial,
 			v.PublishedAt.Format("2006-01-02 15:04:05 MST"), v.Note)
+		if v.Kind == "republish" && v.SourceSerial != nil {
+			line += fmt.Sprintf(" (republish of serial %d)", *v.SourceSerial)
+		}
+		fmt.Println(line)
 	}
 	return nil
 }

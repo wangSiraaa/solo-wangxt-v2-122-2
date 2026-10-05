@@ -33,7 +33,7 @@ internet:
 ## Layout
 
 ```
-cmd/dnszone/         CLI: serve / publish / versions
+cmd/dnszone/         CLI: serve / publish / republish / versions
 internal/config/     JSON config (listeners, TTL bounds, ACL, TSIG keys)
 internal/zone/       master-file parsing, validation, immutable snapshots,
                      lookup (CNAME chase + wildcards), version diffing
@@ -77,7 +77,19 @@ testdata/            example zones and a TSIG key file
    new versions; publish a new file with the same command and queries
    move to the new version atomically.
 
-4. Query and transfer with standard `dig`:
+4. Republish a saved historical version without decreasing the SOA
+   serial:
+
+   ```sh
+   ./bin/dnszone republish -config config.json -serial 1 --note "recover after mistaken v2"
+   ```
+
+   The complete records for serial 1 are read and revalidated against
+   the current rules, then written as a new increasing serial with a
+   fresh changelog. The historical v1, mistaken v2 and new recovery
+   version are all retained.
+
+5. Query and transfer with standard `dig`:
 
    ```sh
    dig @127.0.0.1 -p 5354 www.lab.test A
@@ -101,9 +113,15 @@ file (`dig -k`).
 
 ## Atomicity and transfers
 
-- Each successful publish gets a monotonically increasing serial (the
-  SOA serial is rewritten to it) and a stored change log (`ADD`/`DEL`
-  rows) derived from the previous version, excluding the SOA itself.
+- Each successful publish or historical republish gets a monotonically
+  increasing serial (the SOA serial is rewritten to it) and a stored
+  change log (`ADD`/`DEL` rows) derived from the previously served
+  version, excluding the SOA itself. A republish copies the complete
+  saved RR set, revalidates it under current TTL/zone rules, and records
+  `kind='republish'` plus `source_serial`; the mistaken and source
+  versions remain in history. If the source serial is missing or no
+  longer satisfies current validation, the transaction does not insert a
+  version and the current pointer remains unchanged.
 - **AXFR** emits the complete version bracketed by identical SOA RRs.
   Because the handler captures the snapshot pointer once per request, a
   transfer that starts before a publish finishes keeps streaming the
@@ -123,11 +141,15 @@ go test -race ./...
   conflicts, out-of-zone/unsupported-type rejection, CNAME chains,
   wildcards, negative TTL, diff and AXFR ordering.
 - `internal/server`: AA/no-recursion answers, NXDOMAIN/NODATA
-  authority, out-of-zone REFUSED, atomic snapshot swap, and TSIG+ACL
-  transfer gating over real DNS sockets.
+  authority, out-of-zone REFUSED, atomic snapshot swap, TSIG+ACL
+  transfer gating over real DNS sockets, and an IXFR from a mistaken
+  serial to a historical-content republish.
 - `internal/store` (runs against PostgreSQL; creates/uses
   `dnszone_test`): publish/load, rollback of invalid publishes,
-  concurrent publishing with no serial gaps, and change-log contents.
+  republishing historical content as a new increasing serial with an
+  IXFR delta, no-op behavior for missing versions or history that fails
+  current rules, concurrent publishing with no serial gaps, and
+  change-log contents.
 
 An end-to-end `dig` checklist (flags, negatives, AXFR/IXFR content and
 TSIG bookends) lives at `scripts/verify-dig.sh`.

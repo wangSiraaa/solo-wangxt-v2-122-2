@@ -2,17 +2,21 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/miekg/dns"
 
 	"localtest/dnszone/internal/config"
+	"localtest/dnszone/internal/store"
 	"localtest/dnszone/internal/zone"
 )
 
@@ -259,6 +263,188 @@ func mustConfig(t *testing.T) *config.Config {
 	}
 	return cfg
 }
+
+func isolatedTestDatabase(t *testing.T) (string, *store.Store) {
+	t.Helper()
+	adminURL := os.Getenv("DNSZONE_TEST_ADMIN_DATABASE")
+	if adminURL == "" {
+		adminURL = "postgres://dnsadmin@127.0.0.1:55432/postgres?sslmode=disable&connect_timeout=2"
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	admin, err := pgx.Connect(ctx, adminURL)
+	if err != nil {
+		t.Skipf("test database unavailable: %v", err)
+	}
+	defer admin.Close(ctx)
+
+	name := "dnszone_server_test_" + strings.ReplaceAll(t.Name(), "/", "_")
+	if len(name) > 63 {
+		name = name[:63]
+	}
+	if _, err := admin.Exec(ctx, `DROP DATABASE IF EXISTS `+name); err != nil {
+		t.Skipf("prepare test database: %v", err)
+	}
+	if _, err := admin.Exec(ctx, `CREATE DATABASE `+name); err != nil {
+		t.Skipf("create test database: %v", err)
+	}
+
+	u, err := url.Parse(adminURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Path = "/" + name
+	st, err := store.New(context.Background(), u.String(), testZoneOrigin)
+	if err != nil {
+		t.Skipf("test database unavailable: %v", err)
+	}
+	t.Cleanup(st.Close)
+	return u.String(), st
+}
+
+func TestE2ERepublishIXFRFromMistakenVersion(t *testing.T) {
+	dbURL, st := isolatedTestDatabase(t)
+	ctx := context.Background()
+	lim := zone.Limits{MinTTL: 30, MaxTTL: 86400}
+
+	v1, err := zone.Parse(strings.NewReader(republishV1), testZoneOrigin, lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v2, err := zone.Parse(strings.NewReader(republishV2), testZoneOrigin, lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Publish(ctx, v1, "v1", lim); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Publish(ctx, v2, "mistaken v2", lim); err != nil {
+		t.Fatal(err)
+	}
+	res, err := st.Republish(ctx, 1, "restore v1", lim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Serial <= 2 {
+		t.Fatalf("republished serial = %d, must stay greater than mistaken serial 2", res.Serial)
+	}
+
+	cfg := mustConfigWithDatabase(t, dbURL)
+	srv, err := New(ctx, cfg, st, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	pc, err := net.ListenPacket("udp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	serveCtx, cancelServe := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancelServe()
+		pc.Close()
+		ln.Close()
+	})
+	go srv.Serve(serveCtx, pc, ln)
+	addr := ln.Addr().String()
+
+	tr := new(dns.Transfer)
+	tr.TsigSecret = map[string]string{"xfer.lab.test.": testTSIGB64}
+	q := new(dns.Msg)
+	q.SetQuestion(testZoneOrigin, dns.TypeIXFR)
+	q.Ns = []dns.RR{srv.current().SOA()}
+	q.Ns[0].(*dns.SOA).Serial = 2
+	q.SetTsig("xfer.lab.test.", dns.HmacSHA256, 300, time.Now().Unix())
+	env, err := tr.In(q, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var all []dns.RR
+	for e := range env {
+		if e.Error != nil {
+			t.Fatalf("IXFR envelope: %v", e.Error)
+		}
+		all = append(all, e.RR...)
+	}
+	var soas, dels, adds int
+	for _, rr := range all {
+		text := rr.String()
+		switch {
+		case rr.Header().Rrtype == dns.TypeSOA:
+			soas++
+		case strings.Contains(text, "127.0.0.30") ||
+			strings.Contains(text, "multi-record same name v2"):
+			dels++
+		case strings.Contains(text, "multi-record same name v1"):
+			adds++
+		}
+	}
+	// v2 -> serial 3 must be a forward RFC 1995 delta: remove the mistaken
+	// A and TXT, then add the restored TXT. It must not roll serial 2 back.
+	if soas != 4 || dels != 2 || adds != 1 {
+		t.Fatalf("IXFR serial 2->%d malformed: soas=%d dels=%d adds=%d RRs=%v",
+			res.Serial, soas, dels, adds, all)
+	}
+
+	query := new(dns.Msg)
+	query.SetQuestion("www.lab.test.", dns.TypeA)
+	c := new(dns.Client)
+	r, _, err := c.Exchange(query, addr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(r.Answer) != 2 {
+		t.Fatalf("restored www A count=%d, want v1 content with 2 records", len(r.Answer))
+	}
+	if got := srv.current().SOA().Serial; got != res.Serial {
+		t.Fatalf("served SOA serial = %d, want %d", got, res.Serial)
+	}
+}
+
+func mustConfigWithDatabase(t *testing.T, dbURL string) *config.Config {
+	t.Helper()
+	f, _ := os.CreateTemp(t.TempDir(), "cfg-*.json")
+	if _, err := fmt.Fprintf(f, `{
+	  "zone": "lab.test.", "listen_udp": "127.0.0.1:0", "listen_tcp": "127.0.0.1:0",
+	  "database_url": %q, "ttl_min": 30, "ttl_max": 86400,
+	  "transfer_allow_cidrs": ["127.0.0.0/8"],
+	  "tsig_keys": {"xfer.lab.test.": {"algorithm": "hmac-sha256", "secret_b64": "%s"}}
+	}`, dbURL, testTSIGB64); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	cfg, err := config.Load(f.Name())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+const testZoneOrigin = "lab.test."
+
+const republishV1 = `$ORIGIN lab.test.
+$TTL 3600
+@ IN SOA ns1.lab.test. admin.lab.test. (1 7200 3600 1209600 300)
+@ IN NS ns1.lab.test.
+ns1 IN A 127.0.0.10
+www IN A 127.0.0.20
+www IN A 127.0.0.21
+www IN TXT "multi-record same name v1"
+`
+
+const republishV2 = `$ORIGIN lab.test.
+$TTL 3600
+@ IN SOA ns1.lab.test. admin.lab.test. (1 7200 3600 1209600 300)
+@ IN NS ns1.lab.test.
+ns1 IN A 127.0.0.10
+www IN A 127.0.0.20
+www IN A 127.0.0.21
+www IN A 127.0.0.30
+www IN TXT "multi-record same name v2"
+`
 
 func TestE2ETransferGateAndContent(t *testing.T) {
 	addr := newTestServer(t, snap(t, 7, testZone))

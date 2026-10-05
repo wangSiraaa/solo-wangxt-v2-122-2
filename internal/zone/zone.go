@@ -196,11 +196,24 @@ func Parse(r io.Reader, origin string, lim Limits) ([]dns.RR, error) {
 	if err := zp.Err(); err != nil {
 		return nil, fmt.Errorf("zone parse: %w", err)
 	}
-	if err := validateSet(out, dns.Fqdn(origin)); err != nil {
+	if err := Validate(out, origin, lim); err != nil {
 		return nil, err
 	}
 	sortRRs(out, dns.Fqdn(origin))
 	return out, nil
+}
+
+// Validate checks a complete RR set against the current record and TTL
+// rules. It is used both when parsing a new master file and when
+// republishing records loaded from historical storage.
+func Validate(rrs []dns.RR, origin string, lim Limits) error {
+	origin = dns.Fqdn(origin)
+	for _, rr := range rrs {
+		if err := validateRR(rr, origin, lim); err != nil {
+			return err
+		}
+	}
+	return validateSet(rrs, origin)
 }
 
 // NewSnapshot builds an immutable snapshot with a store-assigned serial.
