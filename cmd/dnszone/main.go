@@ -3,13 +3,15 @@
 //
 // Usage:
 //
-//	dnszone serve   --config config.json
-//	dnszone publish --config config.json --file zone.db [--note "..."]
+//	dnszone serve    --config config.json
+//	dnszone publish  --config config.json --file zone.db [--note "..."]
+//	dnszone restore  --config config.json --serial N [--note "..."]
 //	dnszone versions --config config.json
 package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -35,6 +37,8 @@ func main() {
 		err = runServe(args)
 	case "publish":
 		err = runPublish(args)
+	case "restore":
+		err = runRestore(args)
 	case "versions":
 		err = runVersions(args)
 	case "-h", "--help", "help":
@@ -55,6 +59,7 @@ func usage() {
 Commands:
   serve     run the authoritative UDP/TCP server
   publish   atomically publish a zone file as a new version
+  restore   re-publish a saved version as a new, higher serial
   versions  list published zone versions
 
 Run "<command> -h" for command flags.
@@ -141,6 +146,51 @@ func runPublish(args []string) error {
 	return nil
 }
 
+// runRestore re-publishes an already stored version. The saved full zone
+// record is loaded and re-validated inside the store transaction, then a
+// new strictly-higher serial with a fresh change log is published; the
+// serving snapshot swaps atomically via the normal publish notification.
+// No history row is deleted.
+func runRestore(args []string) error {
+	fs := flag.NewFlagSet("restore", flag.ContinueOnError)
+	cfgPath := fs.String("config", "config.json", "path to config JSON")
+	serial := fs.Uint("serial", 0, "serial of the saved version to re-publish")
+	note := fs.String("note", "", "change note stored with the new version")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *serial == 0 {
+		return errors.New("-serial must name an existing published version (>= 1)")
+	}
+	cfg, err := loadConfig(*cfgPath)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	st, err := store.New(ctx, cfg.DatabaseURL, cfg.ZoneOrigin())
+	if err != nil {
+		return fmt.Errorf("postgres: %w", err)
+	}
+	defer st.Close()
+
+	lim := zone.Limits{MinTTL: cfg.TTLMin, MaxTTL: cfg.TTLMax}
+	if *note == "" {
+		*note = fmt.Sprintf("restore: re-publish version %d after misconfigured release", *serial)
+	}
+	res, err := st.Restore(ctx, uint32(*serial), *note, lim)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("restored content of serial %d as new serial %d (%d record changes)\n",
+		*serial, res.Serial, len(res.Changes))
+	for _, c := range res.Changes {
+		fmt.Printf("  %s %s\n", c.Action, zone.CanonicalText(c.RR))
+	}
+	return nil
+}
+
 func runVersions(args []string) error {
 	fs := flag.NewFlagSet("versions", flag.ContinueOnError)
 	cfgPath := fs.String("config", "config.json", "path to config JSON")
@@ -164,8 +214,12 @@ func runVersions(args []string) error {
 	}
 	fmt.Printf("current zone: %s\n", cfg.ZoneOrigin())
 	for _, v := range vs {
-		fmt.Printf("  serial %d  %s  %q\n", v.Serial,
-			v.PublishedAt.Format("2006-01-02 15:04:05 MST"), v.Note)
+		lineage := ""
+		if v.RestoredFrom > 0 {
+			lineage = fmt.Sprintf("restored-from %d", v.RestoredFrom)
+		}
+		fmt.Printf("  serial %d  %s  %q  %s\n", v.Serial,
+			v.PublishedAt.Format("2006-01-02 15:04:05 MST"), v.Note, lineage)
 	}
 	return nil
 }

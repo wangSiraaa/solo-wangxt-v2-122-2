@@ -29,11 +29,17 @@ internet:
   CNAME/other-record coexistence, duplicate CNAMEs, apex CNAMEs, and
   records whose owner is outside the zone are all rejected and the
   publish rolls back.
+- **Forward-only rollbacks.** A bad release is undone with `restore`,
+  which re-publishes a *saved* version as a brand-new serial: the SOA
+  serial can never move backwards. The historical RR set is re-validated
+  under the current rules, gets a fresh change log, and swaps the serving
+  snapshot atomically. Every version — the restored source, the bad
+  release and the new re-publication — stays in the audit history.
 
 ## Layout
 
 ```
-cmd/dnszone/         CLI: serve / publish / versions
+cmd/dnszone/         CLI: serve / publish / restore / versions
 internal/config/     JSON config (listeners, TTL bounds, ACL, TSIG keys)
 internal/zone/       master-file parsing, validation, immutable snapshots,
                      lookup (CNAME chase + wildcards), version diffing
@@ -67,7 +73,21 @@ testdata/            example zones and a TSIG key file
    ./bin/dnszone publish -config config.json -file testdata/zone-v1.db --note v1
    ```
 
-3. Serve:
+3. Undo a bad release by re-publishing a saved version forward:
+
+   ```sh
+   ./bin/dnszone restore -config config.json -serial 1 --note "backout of misconfigured v2"
+   ```
+
+   Serial 1's complete saved RR set is read back, re-validated against
+   the current TTL/zone rules, and published as the next serial (e.g. 3
+   after a bad v2). The served content matches serial 1 while the SOA
+   serial is higher than v2's; serials 1 and 2 both remain in history.
+   An unknown serial, or a historical record set that fails current
+   validation, aborts before the pointer moves, so the service is
+   unchanged.
+
+4. Serve:
 
    ```sh
    ./bin/dnszone serve -config config.json
@@ -77,7 +97,7 @@ testdata/            example zones and a TSIG key file
    new versions; publish a new file with the same command and queries
    move to the new version atomically.
 
-4. Query and transfer with standard `dig`:
+5. Query and transfer with standard `dig`:
 
    ```sh
    dig @127.0.0.1 -p 5354 www.lab.test A
@@ -104,6 +124,15 @@ file (`dig -k`).
 - Each successful publish gets a monotonically increasing serial (the
   SOA serial is rewritten to it) and a stored change log (`ADD`/`DEL`
   rows) derived from the previous version, excluding the SOA itself.
+- `restore -serial N` is a publish whose RR set comes from version N's
+  saved records instead of a zone file. It runs in the same
+  row-lock-serialized transaction: the full RR set is inserted under the
+  next serial, the change log is the diff from the *current* version,
+  and the current pointer moves on commit. The new `zone_versions` row
+  records `restored_from = N`; `versions` shows the lineage and nothing
+  is ever deleted. If N does not exist, or its records fail the current
+  allow-list/TTL/zone-semantic validation, the transaction rolls back
+  and the served version does not change.
 - **AXFR** emits the complete version bracketed by identical SOA RRs.
   Because the handler captures the snapshot pointer once per request, a
   transfer that starts before a publish finishes keeps streaming the
@@ -127,7 +156,13 @@ go test -race ./...
   transfer gating over real DNS sockets.
 - `internal/store` (runs against PostgreSQL; creates/uses
   `dnszone_test`): publish/load, rollback of invalid publishes,
-  concurrent publishing with no serial gaps, and change-log contents.
+  concurrent publishing with no serial gaps, change-log contents, and
+  restore (forward serial, preserved audit lineage, no-op on a missing
+  version or on history failing current validation).
+- `internal/server` additionally runs one full-stack test against
+  `dnszone_test_xfer`: v1/v2 publish, restore to v1 with a higher serial,
+  v1 content on queries, and an RFC 1995 IXFR v2→current carrying the
+  reverse delta.
 
 An end-to-end `dig` checklist (flags, negatives, AXFR/IXFR content and
 TSIG bookends) lives at `scripts/verify-dig.sh`.

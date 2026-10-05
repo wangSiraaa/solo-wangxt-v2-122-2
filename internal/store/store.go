@@ -46,6 +46,9 @@ func New(ctx context.Context, url, origin string) (*Store, error) {
 // Close releases the pool.
 func (s *Store) Close() { s.pool.Close() }
 
+// Pool exposes the underlying pool for test setup (truncating tables).
+func (s *Store) Pool() *pgxpool.Pool { return s.pool }
+
 func (s *Store) migrate(ctx context.Context) error {
 	stmts := []string{
 		`CREATE TABLE IF NOT EXISTS zone_meta (
@@ -58,8 +61,12 @@ func (s *Store) migrate(ctx context.Context) error {
     serial       bigint PRIMARY KEY,
     origin       text NOT NULL,
     published_at timestamptz NOT NULL DEFAULT now(),
-    note         text NOT NULL DEFAULT ''
+    note         text NOT NULL DEFAULT '',
+    restored_from bigint REFERENCES zone_versions(serial)
 )`,
+		// Migration for databases created before restore existed: add the
+		// column without rewriting existing rows (NULL = ordinary publish).
+		`ALTER TABLE zone_versions ADD COLUMN IF NOT EXISTS restored_from bigint REFERENCES zone_versions(serial)`,
 		`CREATE TABLE IF NOT EXISTS zone_records (
     serial    bigint NOT NULL REFERENCES zone_versions(serial) ON DELETE CASCADE,
     position  integer NOT NULL,
@@ -105,9 +112,10 @@ func (s *Store) CurrentSerial(ctx context.Context) (uint32, error) {
 
 // PublishedVersion is one row of the version history.
 type PublishedVersion struct {
-	Serial      uint32
-	PublishedAt time.Time
-	Note        string
+	Serial       uint32
+	PublishedAt  time.Time
+	Note         string
+	RestoredFrom uint32 // 0 for an ordinary publish; otherwise the version this one re-publishes
 }
 
 // ListVersions returns version metadata, newest first.
@@ -116,7 +124,8 @@ func (s *Store) ListVersions(ctx context.Context, limit int) ([]PublishedVersion
 		limit = 50
 	}
 	rows, err := s.pool.Query(ctx,
-		`SELECT serial, published_at, note FROM zone_versions ORDER BY serial DESC LIMIT $1`, limit)
+		`SELECT serial, published_at, note, COALESCE(restored_from, 0)
+		 FROM zone_versions ORDER BY serial DESC LIMIT $1`, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -124,11 +133,12 @@ func (s *Store) ListVersions(ctx context.Context, limit int) ([]PublishedVersion
 	var out []PublishedVersion
 	for rows.Next() {
 		var v PublishedVersion
-		var serial int64
-		if err := rows.Scan(&serial, &v.PublishedAt, &v.Note); err != nil {
+		var serial, restoredFrom int64
+		if err := rows.Scan(&serial, &v.PublishedAt, &v.Note, &restoredFrom); err != nil {
 			return nil, err
 		}
 		v.Serial = uint32(serial)
+		v.RestoredFrom = uint32(restoredFrom)
 		out = append(out, v)
 	}
 	return out, rows.Err()
